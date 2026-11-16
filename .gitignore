@@ -1,1 +1,4 @@
 TestHardware.md
+.toolchains/
+.deps/
+build*/
