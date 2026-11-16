@@ -5,11 +5,11 @@
  *
  * Algorithm overview (decimation in time, natural order in and out):
  *
- *   1. Leaf pass (in -> out). The input is read through L = 8 or 16 sequential streams.
- *      A size L DFT is computed "vertically", every vector lane working on a different
- *      sub-sequence. The result registers are transposed and stored so that each lane's L
- *      results form a contiguous run in the output. The runs are placed in bit reversed
- *      order; the bit reversal permutation is thereby merged into the first pass.
+ *   1. Leaf pass (in -> out). The input is read through L (8 .. 64) sequential streams.
+ *      Small DFTs are computed "vertically", every vector lane working on a different
+ *      sub-sequence. The result registers are transposed and stored so that each lane's
+ *      results form a contiguous run of L points in the output. The runs are placed in bit
+ *      reversed order; the bit reversal permutation is thereby merged into the first pass.
  *   2. Middle passes (in place on out). Radix 4 or 8 butterflies that combine 4 or 8
  *      adjacent sub-transforms of S points into one of 4S or 8S points.
  *   3. Final pass (in place on out). Like a middle pass, but stores interleaved complex.
@@ -27,8 +27,14 @@
 #define TWOFFT_CAT3(a, b, c) TWOFFT_CAT3_(a, b, c)
 #define FN(name) TWOFFT_CAT3(twofft_, TWOFFT_ISA, name)
 
+/* Properties of this instantiation for the instruction set independent code. */
+enum { FN(vw) = TWOFFT_VW, FN(ratio_twiddles) = TWOFFT_RATIO_TWIDDLES };
+
 #define KINLINE TWOFFT_TARGET TWOFFT_FORCE_INLINE
-#define KFUNC TWOFFT_TARGET static
+#ifndef TWOFFT_KFUNC_ATTR
+#define TWOFFT_KFUNC_ATTR
+#endif
+#define KFUNC TWOFFT_TARGET TWOFFT_KFUNC_ATTR static
 
 /* ---------------------------------------------------------------------------------------
  * Vertical DFT codelets. All operate on complex vectors given as r[] / i[] arrays.
@@ -85,104 +91,12 @@ KINLINE void FN(dft8)(vf *r, vf *i)
     r[6] = v_fmadd(r[6], c, ur), i[6] = v_fnmadd(i[6], c, ui);
 }
 
-/* Forward DFT of 16 values in natural order. Output k is left in slot TWOFFT_SLOT16(k). */
-#define TWOFFT_SLOT16(k) ((((k)&3) << 2) + ((k) >> 2))
-KINLINE void FN(dft16)(vf *r, vf *i)
-{
-    vf t;
-    /* Z_j = DFT4(x[j], x[j+4], x[j+8], x[j+12]); Z_j[k] in slot j + 4k */
-    FN(dft4)(r + 0, i + 0, 4);
-    FN(dft4)(r + 1, i + 1, 4);
-    FN(dft4)(r + 2, i + 2, 4);
-    FN(dft4)(r + 3, i + 3, 4);
-    /* Z_j[k] *= w16^(j k) */
-    FN(cmulc)(r + 5, i + 5, TWOFFT_COS_PI_8, -TWOFFT_SIN_PI_8);  /* w^1 */
-    FN(cmulc)(r + 6, i + 6, TWOFFT_SQRT1_2, -TWOFFT_SQRT1_2);    /* w^2 */
-    FN(cmulc)(r + 7, i + 7, TWOFFT_SIN_PI_8, -TWOFFT_COS_PI_8);  /* w^3 */
-    FN(cmulc)(r + 9, i + 9, TWOFFT_SQRT1_2, -TWOFFT_SQRT1_2);    /* w^2 */
-    t = r[10], r[10] = i[10], i[10] = v_neg(t);                  /* w^4 = -i */
-    FN(cmulc)(r + 11, i + 11, -TWOFFT_SQRT1_2, -TWOFFT_SQRT1_2); /* w^6 */
-    FN(cmulc)(r + 13, i + 13, TWOFFT_SIN_PI_8, -TWOFFT_COS_PI_8);  /* w^3 */
-    FN(cmulc)(r + 14, i + 14, -TWOFFT_SQRT1_2, -TWOFFT_SQRT1_2);   /* w^6 */
-    FN(cmulc)(r + 15, i + 15, -TWOFFT_COS_PI_8, TWOFFT_SIN_PI_8);  /* w^9 */
-    /* X[k + 4q] = DFT4 over j of Z_j[k]; left in slot 4k + q */
-    FN(dft4)(r + 0, i + 0, 1);
-    FN(dft4)(r + 4, i + 4, 1);
-    FN(dft4)(r + 8, i + 8, 1);
-    FN(dft4)(r + 12, i + 12, 1);
-}
-
 /* ---------------------------------------------------------------------------------------
- * Leaf pass: bit reversal + first 3 or 4 levels, interleaved `in` -> split block `out`.
- * ------------------------------------------------------------------------------------ */
-
-KINLINE void FN(leaf_impl)(const float *restrict in, float *restrict out, const unsigned n,
-                           const unsigned llog, const int inv)
-{
-    enum { VW = TWOFFT_VW, L = 16 };
-    const size_t len = (size_t)1 << llog;                /* L: DFT size of the leaf */
-    const size_t ntiles = ((size_t)1 << n) / (len * VW); /* one tile = L streams x VW lanes */
-    const size_t stride = (size_t)2 << (n - llog);       /* distance of the input streams */
-    float *o[VW];
-    size_t rev = 0; /* bit reversed tile index */
-    size_t m;
-    unsigned a, c, j;
-    for (c = 0; c < VW; c++)
-        o[c] = out + 2 * len * ntiles * twofft_bitrev(TWOFFT_LANE_ELEM(c), TWOFFT_VW_LOG2);
-    for (m = 0; m < ntiles; m++) {
-        const float *p = in + 2 * VW * m;
-        const size_t off = 2 * len * rev;
-        vf r[L], i[L];
-        for (a = 0; a < len; a++) {
-            if (inv)
-                V_LOAD2(p + a * stride, i[a], r[a]);
-            else
-                V_LOAD2(p + a * stride, r[a], i[a]);
-        }
-        if (llog == 3)
-            FN(dft8)(r, i);
-        else
-            FN(dft16)(r, i);
-        for (j = 0; j < len; j += VW) {
-            vf tr[VW], ti[VW];
-            for (c = 0; c < VW; c++) {
-                const unsigned k = j + c;
-                const unsigned slot = ((k & 3) << (llog - 2)) + (k >> 2);
-                tr[c] = r[slot];
-                ti[c] = i[slot];
-            }
-            V_TRANSPOSE(tr);
-            V_TRANSPOSE(ti);
-            for (c = 0; c < VW; c++) {
-                v_store(o[c] + off + 2 * j, tr[c]);
-                v_store(o[c] + off + 2 * j + VW, ti[c]);
-            }
-        }
-        rev = twofft_bitrev_next(rev, ntiles);
-    }
-}
-
-KFUNC void FN(leaf8_fwd)(const float *restrict in, float *restrict out, unsigned n)
-{
-    FN(leaf_impl)(in, out, n, 3, 0);
-}
-KFUNC void FN(leaf8_inv)(const float *restrict in, float *restrict out, unsigned n)
-{
-    FN(leaf_impl)(in, out, n, 3, 1);
-}
-KFUNC void FN(leaf16_fwd)(const float *restrict in, float *restrict out, unsigned n)
-{
-    FN(leaf_impl)(in, out, n, 4, 0);
-}
-KFUNC void FN(leaf16_inv)(const float *restrict in, float *restrict out, unsigned n)
-{
-    FN(leaf_impl)(in, out, n, 4, 1);
-}
-
-/* ---------------------------------------------------------------------------------------
- * Radix 4 and radix 8 passes. `x` holds nblk blocks of 4S (8S) complex numbers in split
- * block format. Sub-block p of a block holds the size S transform of the sub-sequence
- * with offset bitrev(p). mode: 0 = middle pass, 1 = final forward, 2 = final inverse.
+ * Radix 4 and radix 8 butterflies on split block data.
+ *
+ * A butterfly combines 4 (8) sub-transforms of S points into one of 4S (8S) points.
+ * Sub-block p of a block holds the transform of the sub-sequence with offset bitrev(p).
+ * mode: 0 = store split blocks, 1 / 2 = store interleaved for a forward / inverse transform.
  * ------------------------------------------------------------------------------------ */
 
 #define TWOFFT_PASS_MIDDLE 0
@@ -201,42 +115,289 @@ KINLINE void FN(pass_store)(float *x, const vf re, const vf im, const int mode)
     }
 }
 
-/* tw: per vector position p the twiddles w^1, w^2, w^3 (w = exp(-2 pi i (p + lane) / 4S)),
- * each as VW real parts followed by VW imaginary parts. */
+#if TWOFFT_RATIO_TWIDDLES
+
+/* Number of twiddle vectors per vector position of a radix 4 / radix 8 butterfly. */
+#define TWOFFT_NW4 4
+#define TWOFFT_NW8 8
+
+/* (a, b) <- (a + w b, a - w b) for w = c (1 + i r): six fused multiply-adds. */
+KINLINE void FN(tbf)(vf *ar, vf *ai, vf *br, vf *bi, const vf c, const vf r)
+{
+    const vf u = v_fnmadd(*br, r, *bi), v = v_fmadd(*bi, r, *br);
+    *br = v_fnmadd(*ar, c, u);
+    *bi = v_fnmadd(*ai, c, v);
+    *ar = v_fmadd(*ar, c, u);
+    *ai = v_fmadd(*ai, c, v);
+}
+
+/* (a, b) <- (a - i w b, a + i w b) */
+KINLINE void FN(tbf_i)(vf *ar, vf *ai, vf *br, vf *bi, const vf c, const vf r)
+{
+    const vf u = v_fnmadd(*br, r, *bi), v = v_fmadd(*bi, r, *br);
+    *br = v_fnmadd(*ar, c, v);
+    *bi = v_fmadd(*ai, c, u);
+    *ar = v_fmadd(*ar, c, v);
+    *ai = v_fnmadd(*ai, c, u);
+}
+
+/* w: the twiddles w^2, w (w = exp(-2 pi i (position + lane) / 4S)) as 4 vectors (c, r, c, r). */
+KINLINE void FN(bf4)(float *x0, float *x1, float *x2, float *x3, const vf *w, const int mode)
+{
+    enum { VW = TWOFFT_VW };
+    vf ar = v_load(x0), ai = v_load(x0 + VW);
+    vf br = v_load(x1), bi = v_load(x1 + VW);
+    vf cr = v_load(x2), ci = v_load(x2 + VW);
+    vf dr = v_load(x3), di = v_load(x3 + VW);
+    /* two radix 2 levels; sub-blocks hold offsets 0, 2, 1, 3 */
+    FN(tbf)(&ar, &ai, &br, &bi, w[0], w[1]);
+    FN(tbf)(&cr, &ci, &dr, &di, w[0], w[1]);
+    FN(tbf)(&ar, &ai, &cr, &ci, w[2], w[3]);
+    FN(tbf_i)(&br, &bi, &dr, &di, w[2], w[3]);
+    FN(pass_store)(x0, ar, ai, mode);
+    FN(pass_store)(x1, br, bi, mode);
+    FN(pass_store)(x2, cr, ci, mode);
+    FN(pass_store)(x3, dr, di, mode);
+}
+
+/* x: position in the first sub-block, dist: distance of the sub-blocks in floats,
+ * w: the twiddles w^4, w^2, w, w8 w (w = exp(-2 pi i (position + lane) / 8S),
+ * w8 = exp(-2 pi i / 8)) as 8 vectors. */
+KINLINE void FN(bf8)(float *x, const size_t dist, const vf *w, const int mode)
+{
+    enum { VW = TWOFFT_VW };
+    vf r[8], i[8];
+    unsigned j;
+    for (j = 0; j < 8; j++) {
+        r[j] = v_load(x + dist * j);
+        i[j] = v_load(x + dist * j + VW);
+    }
+    /* three radix 2 levels; sub-block q holds offset bitrev3(q) */
+    FN(tbf)(r + 0, i + 0, r + 1, i + 1, w[0], w[1]);
+    FN(tbf)(r + 2, i + 2, r + 3, i + 3, w[0], w[1]);
+    FN(tbf)(r + 4, i + 4, r + 5, i + 5, w[0], w[1]);
+    FN(tbf)(r + 6, i + 6, r + 7, i + 7, w[0], w[1]);
+    FN(tbf)(r + 0, i + 0, r + 2, i + 2, w[2], w[3]);
+    FN(tbf_i)(r + 1, i + 1, r + 3, i + 3, w[2], w[3]);
+    FN(tbf)(r + 4, i + 4, r + 6, i + 6, w[2], w[3]);
+    FN(tbf_i)(r + 5, i + 5, r + 7, i + 7, w[2], w[3]);
+    FN(tbf)(r + 0, i + 0, r + 4, i + 4, w[4], w[5]);
+    FN(tbf)(r + 1, i + 1, r + 5, i + 5, w[6], w[7]);
+    FN(tbf_i)(r + 2, i + 2, r + 6, i + 6, w[4], w[5]);
+    FN(tbf_i)(r + 3, i + 3, r + 7, i + 7, w[6], w[7]);
+    for (j = 0; j < 8; j++)
+        FN(pass_store)(x + dist * j, r[j], i[j], mode);
+}
+
+#else /* !TWOFFT_RATIO_TWIDDLES */
+
+#define TWOFFT_NW4 6
+#define TWOFFT_NW8 14
+
+/* w: the twiddles w^1, w^2, w^3 (w = exp(-2 pi i (position + lane) / 4S)) as 6 vectors
+ * (re, im, re, im, re, im). */
+KINLINE void FN(bf4)(float *x0, float *x1, float *x2, float *x3, const vf *w, const int mode)
+{
+    enum { VW = TWOFFT_VW };
+    const vf ar = v_load(x0), ai = v_load(x0 + VW);
+    const vf br = v_load(x1), bi = v_load(x1 + VW);
+    const vf cr = v_load(x2), ci = v_load(x2 + VW);
+    const vf dr = v_load(x3), di = v_load(x3 + VW);
+    /* sub-blocks hold offsets 0, 2, 1, 3 */
+    const vf t2r = v_fnmadd(v_mul(w[2], br), w[3], bi), t2i = v_fmadd(v_mul(w[2], bi), w[3], br);
+    const vf t1r = v_fnmadd(v_mul(w[0], cr), w[1], ci), t1i = v_fmadd(v_mul(w[0], ci), w[1], cr);
+    const vf t3r = v_fnmadd(v_mul(w[4], dr), w[5], di), t3i = v_fmadd(v_mul(w[4], di), w[5], dr);
+    const vf s02r = v_add(ar, t2r), s02i = v_add(ai, t2i);
+    const vf d02r = v_sub(ar, t2r), d02i = v_sub(ai, t2i);
+    const vf s13r = v_add(t1r, t3r), s13i = v_add(t1i, t3i);
+    const vf d13r = v_sub(t1r, t3r), d13i = v_sub(t1i, t3i);
+    FN(pass_store)(x0, v_add(s02r, s13r), v_add(s02i, s13i), mode);
+    FN(pass_store)(x1, v_add(d02r, d13i), v_sub(d02i, d13r), mode);
+    FN(pass_store)(x2, v_sub(s02r, s13r), v_sub(s02i, s13i), mode);
+    FN(pass_store)(x3, v_sub(d02r, d13i), v_add(d02i, d13r), mode);
+}
+
+/* x: position in the first sub-block, dist: distance of the sub-blocks in floats,
+ * w: the twiddles w^1 .. w^7 (w = exp(-2 pi i (position + lane) / 8S)) as 14 vectors. */
+KINLINE void FN(bf8)(float *x, const size_t dist, const vf *w, const int mode)
+{
+    enum { VW = TWOFFT_VW };
+    vf r[8], i[8];
+    unsigned j;
+    /* sub-block q holds offset bitrev3(q) */
+    for (j = 0; j < 8; j++) {
+        const float *src = x + dist * twofft_bitrev(j, 3);
+        r[j] = v_load(src);
+        i[j] = v_load(src + VW);
+    }
+    for (j = 1; j < 8; j++) {
+        const vf wr = w[2 * j - 2], wi = w[2 * j - 1], zr = r[j], zi = i[j];
+        r[j] = v_fnmadd(v_mul(wr, zr), wi, zi);
+        i[j] = v_fmadd(v_mul(wr, zi), wi, zr);
+    }
+    FN(dft8)(r, i);
+    for (j = 0; j < 8; j++)
+        FN(pass_store)(x + dist * j, r[TWOFFT_SLOT8(j)], i[TWOFFT_SLOT8(j)], mode);
+}
+
+#endif /* TWOFFT_RATIO_TWIDDLES */
+
+/* ---------------------------------------------------------------------------------------
+ * Leaf pass: bit reversal + first levels, interleaved `in` -> split block `out`.
+ *
+ * One tile reads L = L1 * R input streams and produces VW runs of L output points.
+ * Stage 1: for each of the R groups of L1 streams a vertical DFT of size L1 whose results
+ *          are transposed and stored into the VW runs (as sub-transforms of L1 points).
+ * Stage 2: (R > 1) a radix R butterfly combines the R sub-transforms of every run; its
+ *          twiddles are constant and kept in registers where possible.
+ * Running stage 2 right after stage 1 keeps a tile in registers and store buffers, and
+ * stage 1 alone never needs more registers than a size 8 DFT.
+ * ------------------------------------------------------------------------------------ */
+
+KINLINE void FN(leaf_impl)(const float *restrict in, float *restrict out, const unsigned n,
+                           const unsigned l1log, const unsigned rlog, const float *restrict tw, const int inv)
+{
+    enum { VW = TWOFFT_VW, MAXL1 = 8, MAXHOIST = 14 };
+    const size_t L1 = (size_t)1 << l1log, R = (size_t)1 << rlog, L = L1 * R;
+    const size_t ntiles = ((size_t)1 << n) / (L * VW);
+    const size_t gdist = (size_t)2 << (n - l1log - rlog); /* distance of adjacent streams */
+    const size_t sdist = gdist << rlog;                   /* distance of the streams of a group */
+    const unsigned nw = rlog == 2 ? TWOFFT_NW4 : TWOFFT_NW8; /* twiddle vectors per position */
+    const unsigned ntw = (unsigned)(nw * (L1 / VW));         /* twiddle vectors of stage 2 */
+    vf hoisted[MAXHOIST];
+    float *o[VW];
+    size_t rev = 0; /* bit reversed tile index */
+    size_t m;
+    unsigned a, c, g, j;
+    for (c = 0; c < VW; c++)
+        o[c] = out + 2 * L * ntiles * twofft_bitrev(TWOFFT_LANE_ELEM(c), TWOFFT_VW_LOG2);
+    if (rlog != 0 && ntw <= MAXHOIST)
+        for (j = 0; j < ntw; j++)
+            hoisted[j] = v_load(tw + VW * j);
+    for (m = 0; m < ntiles; m++) {
+        const float *p = in + 2 * VW * m;
+        const size_t off = 2 * L * rev;
+        for (g = 0; g < R; g++) {
+            const float *pg = p + g * gdist;
+            const size_t sub = off + 2 * L1 * twofft_bitrev(g, rlog);
+            vf r[MAXL1], i[MAXL1];
+            for (a = 0; a < L1; a++) {
+                if (inv)
+                    V_LOAD2(pg + a * sdist, i[a], r[a]);
+                else
+                    V_LOAD2(pg + a * sdist, r[a], i[a]);
+            }
+            if (l1log == 2)
+                FN(dft4)(r, i, 1);
+            else
+                FN(dft8)(r, i);
+            for (j = 0; j < L1; j += VW) {
+                vf tr[VW], ti[VW];
+                for (c = 0; c < VW; c++) {
+                    const unsigned k = j + c;
+                    const unsigned slot = l1log == 2 ? k : TWOFFT_SLOT8(k);
+                    tr[c] = r[slot];
+                    ti[c] = i[slot];
+                }
+                V_TRANSPOSE(tr);
+                V_TRANSPOSE(ti);
+                for (c = 0; c < VW; c++) {
+                    v_store(o[c] + sub + 2 * j, tr[c]);
+                    v_store(o[c] + sub + 2 * j + VW, ti[c]);
+                }
+            }
+        }
+        if (rlog != 0) {
+            for (c = 0; c < VW; c++) {
+                float *x = o[c] + off;
+                for (j = 0; j < L1; j += VW) {
+                    vf loaded[TWOFFT_NW8];
+                    const vf *w = hoisted + nw * (j / VW);
+                    unsigned q;
+                    if (ntw > MAXHOIST) {
+                        for (q = 0; q < nw; q++)
+                            loaded[q] = v_load(tw + VW * (nw * (j / VW) + q));
+                        w = loaded;
+                    }
+                    if (rlog == 2)
+                        FN(bf4)(x + 2 * j, x + 2 * j + 2 * L1, x + 2 * j + 4 * L1, x + 2 * j + 6 * L1, w,
+                                TWOFFT_PASS_MIDDLE);
+                    else
+                        FN(bf8)(x + 2 * j, 2 * L1, w, TWOFFT_PASS_MIDDLE);
+                }
+            }
+        }
+        rev = twofft_bitrev_next(rev, ntiles);
+    }
+}
+
+/* The leaf variants: twofft_<isa>_leaf_<L1>x<R>_{fwd,inv} */
+#define TWOFFT_DEFINE_LEAF(name, l1log, rlog)                                                                \
+    KFUNC void FN(name##_fwd)(const float *restrict in, float *restrict out, unsigned n, const float *tw)   \
+    {                                                                                                        \
+        FN(leaf_impl)(in, out, n, l1log, rlog, tw, 0);                                                       \
+    }                                                                                                        \
+    KFUNC void FN(name##_inv)(const float *restrict in, float *restrict out, unsigned n, const float *tw)   \
+    {                                                                                                        \
+        FN(leaf_impl)(in, out, n, l1log, rlog, tw, 1);                                                       \
+    }
+#if TWOFFT_VW <= 4
+TWOFFT_DEFINE_LEAF(leaf_4x4, 2, 2)
+TWOFFT_DEFINE_LEAF(leaf_4x8, 2, 3)
+#endif
+TWOFFT_DEFINE_LEAF(leaf_8x1, 3, 0)
+TWOFFT_DEFINE_LEAF(leaf_8x4, 3, 2)
+TWOFFT_DEFINE_LEAF(leaf_8x8, 3, 3)
+#undef TWOFFT_DEFINE_LEAF
+
+KFUNC void FN(leaf)(const twofft_plan *pl, const float *restrict in, float *restrict out, int inv)
+{
+    const unsigned n = pl->log2n;
+    switch (pl->leaf_l1_log * 4 + pl->leaf_radix_log) {
+#if TWOFFT_VW <= 4
+    case 2 * 4 + 2:
+        if (inv) FN(leaf_4x4_inv)(in, out, n, pl->leaf_tw); else FN(leaf_4x4_fwd)(in, out, n, pl->leaf_tw);
+        break;
+    case 2 * 4 + 3:
+        if (inv) FN(leaf_4x8_inv)(in, out, n, pl->leaf_tw); else FN(leaf_4x8_fwd)(in, out, n, pl->leaf_tw);
+        break;
+#endif
+    case 3 * 4 + 2:
+        if (inv) FN(leaf_8x4_inv)(in, out, n, pl->leaf_tw); else FN(leaf_8x4_fwd)(in, out, n, pl->leaf_tw);
+        break;
+    case 3 * 4 + 3:
+        if (inv) FN(leaf_8x8_inv)(in, out, n, pl->leaf_tw); else FN(leaf_8x8_fwd)(in, out, n, pl->leaf_tw);
+        break;
+    default:
+        if (inv) FN(leaf_8x1_inv)(in, out, n, pl->leaf_tw); else FN(leaf_8x1_fwd)(in, out, n, pl->leaf_tw);
+        break;
+    }
+}
+
+/* ---------------------------------------------------------------------------------------
+ * Radix 4 and radix 8 passes over nblk blocks of 4S (8S) points.
+ * tw: for every vector position the twiddles of the butterfly, see twofft_make_twiddles().
+ * ------------------------------------------------------------------------------------ */
+
 KINLINE void FN(pass4_impl)(float *restrict x, const size_t S, const size_t nblk,
                             const float *restrict tw, const int mode)
 {
     enum { VW = TWOFFT_VW };
     size_t b, p;
+    unsigned j;
     for (b = 0; b < nblk; b++) {
         float *x0 = x + 8 * S * b, *x1 = x0 + 2 * S, *x2 = x0 + 4 * S, *x3 = x0 + 6 * S;
         const float *t = tw;
         for (p = 0; p < S; p += VW) {
-            const vf ar = v_load(x0), ai = v_load(x0 + VW);
-            const vf br = v_load(x1), bi = v_load(x1 + VW);
-            const vf cr = v_load(x2), ci = v_load(x2 + VW);
-            const vf dr = v_load(x3), di = v_load(x3 + VW);
-            const vf w1r = v_load(t), w1i = v_load(t + VW);
-            const vf w2r = v_load(t + 2 * VW), w2i = v_load(t + 3 * VW);
-            const vf w3r = v_load(t + 4 * VW), w3i = v_load(t + 5 * VW);
-            /* sub-blocks hold offsets 0, 2, 1, 3 */
-            const vf t2r = v_fnmadd(v_mul(w2r, br), w2i, bi), t2i = v_fmadd(v_mul(w2r, bi), w2i, br);
-            const vf t1r = v_fnmadd(v_mul(w1r, cr), w1i, ci), t1i = v_fmadd(v_mul(w1r, ci), w1i, cr);
-            const vf t3r = v_fnmadd(v_mul(w3r, dr), w3i, di), t3i = v_fmadd(v_mul(w3r, di), w3i, dr);
-            const vf s02r = v_add(ar, t2r), s02i = v_add(ai, t2i);
-            const vf d02r = v_sub(ar, t2r), d02i = v_sub(ai, t2i);
-            const vf s13r = v_add(t1r, t3r), s13i = v_add(t1i, t3i);
-            const vf d13r = v_sub(t1r, t3r), d13i = v_sub(t1i, t3i);
-            FN(pass_store)(x0, v_add(s02r, s13r), v_add(s02i, s13i), mode);
-            FN(pass_store)(x1, v_add(d02r, d13i), v_sub(d02i, d13r), mode);
-            FN(pass_store)(x2, v_sub(s02r, s13r), v_sub(s02i, s13i), mode);
-            FN(pass_store)(x3, v_sub(d02r, d13i), v_add(d02i, d13r), mode);
-            x0 += 2 * VW, x1 += 2 * VW, x2 += 2 * VW, x3 += 2 * VW, t += 6 * VW;
+            vf w[TWOFFT_NW4];
+            for (j = 0; j < TWOFFT_NW4; j++)
+                w[j] = v_load(t + VW * j);
+            FN(bf4)(x0, x1, x2, x3, w, mode);
+            x0 += 2 * VW, x1 += 2 * VW, x2 += 2 * VW, x3 += 2 * VW, t += TWOFFT_NW4 * VW;
         }
     }
 }
 
-/* tw: per vector position the twiddles w^1 .. w^7 (w = exp(-2 pi i (p + lane) / 8S)). */
 KINLINE void FN(pass8_impl)(float *restrict x, const size_t S, const size_t nblk,
                             const float *restrict tw, const int mode)
 {
@@ -247,23 +408,11 @@ KINLINE void FN(pass8_impl)(float *restrict x, const size_t S, const size_t nblk
         float *xb = x + 16 * S * b;
         const float *t = tw;
         for (p = 0; p < S; p += VW) {
-            vf r[8], i[8];
-            /* sub-block q holds offset bitrev3(q) */
-            for (j = 0; j < 8; j++) {
-                const float *src = xb + 2 * S * twofft_bitrev(j, 3);
-                r[j] = v_load(src);
-                i[j] = v_load(src + VW);
-            }
-            for (j = 1; j < 8; j++) {
-                const vf wr = v_load(t + 2 * VW * (j - 1)), wi = v_load(t + 2 * VW * (j - 1) + VW);
-                const vf zr = r[j], zi = i[j];
-                r[j] = v_fnmadd(v_mul(wr, zr), wi, zi);
-                i[j] = v_fmadd(v_mul(wr, zi), wi, zr);
-            }
-            FN(dft8)(r, i);
-            for (j = 0; j < 8; j++)
-                FN(pass_store)(xb + 2 * S * j, r[TWOFFT_SLOT8(j)], i[TWOFFT_SLOT8(j)], mode);
-            xb += 2 * VW, t += 14 * VW;
+            vf w[TWOFFT_NW8];
+            for (j = 0; j < TWOFFT_NW8; j++)
+                w[j] = v_load(t + VW * j);
+            FN(bf8)(xb, 2 * S, w, mode);
+            xb += 2 * VW, t += TWOFFT_NW8 * VW;
         }
     }
 }
@@ -294,7 +443,7 @@ KFUNC void FN(final8_inv)(float *restrict x, size_t S, const float *restrict tw)
 }
 
 /* ---------------------------------------------------------------------------------------
- * Driver for N >= 32.
+ * Driver for planned sizes.
  * ------------------------------------------------------------------------------------ */
 
 /* Applies passes 0 .. k-1 to the block of 2^(log2 size after pass k-1) points at x.
@@ -331,19 +480,13 @@ KFUNC void FN(transform)(const twofft_plan *pl, const float *restrict in, float 
     const unsigned last = pl->npasses - 1u;
     const size_t S = (size_t)1 << (pl->size_log[last] - pl->radix_log[last]);
     size_t q;
-    if (pl->leaf_log == 3) {
-        if (inv)
-            FN(leaf8_inv)(in, out, pl->log2n);
-        else
-            FN(leaf8_fwd)(in, out, pl->log2n);
-    } else {
-        if (inv)
-            FN(leaf16_inv)(in, out, pl->log2n);
-        else
-            FN(leaf16_fwd)(in, out, pl->log2n);
-    }
-    for (q = 0; q < ((size_t)1 << pl->radix_log[last]); q++)
-        FN(middle)(pl, out + 2 * S * q, last);
+    if (TWOFFT_STAGE_ENABLED(1))
+        FN(leaf)(pl, in, out, inv);
+    if (TWOFFT_STAGE_ENABLED(2))
+        for (q = 0; q < ((size_t)1 << pl->radix_log[last]); q++)
+            FN(middle)(pl, out + 2 * S * q, last);
+    if (!TWOFFT_STAGE_ENABLED(4))
+        return;
     if (pl->radix_log[last] == 2) {
         if (inv)
             FN(final4_inv)(out, S, pl->tw[last]);
@@ -437,6 +580,8 @@ KFUNC void FN(fft16_inv)(const float *restrict in, float *restrict out) { FN(fft
 
 #endif /* TWOFFT_VW == 4 */
 
+#undef TWOFFT_NW4
+#undef TWOFFT_NW8
 #undef FN
 #undef KINLINE
 #undef KFUNC

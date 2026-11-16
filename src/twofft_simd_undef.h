@@ -4,6 +4,7 @@
 #undef TWOFFT_TARGET
 #undef TWOFFT_VW
 #undef TWOFFT_VW_LOG2
+#undef TWOFFT_RATIO_TWIDDLES
 #undef TWOFFT_LANE_ELEM
 #undef vf
 #undef v_load

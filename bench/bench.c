@@ -22,12 +22,7 @@
 #include <string.h>
 #include <time.h>
 
-#if defined(__linux__)
-#include <sched.h>
-#endif
-#if defined(__APPLE__)
-#include <pthread.h>
-#endif
+#include "bench_util.h"
 
 #ifdef BENCH_FFTW
 #include <fftw3.h>
@@ -39,21 +34,12 @@
 #include "kiss_fft.h"
 #endif
 #ifdef BENCH_KFR
+#include <stdbool.h>
 #include <kfr/capi.h>
 #endif
 #ifdef BENCH_VDSP
 #include <Accelerate/Accelerate.h>
 #endif
-#ifdef BENCH_POCKETFFT
-#include "pocketfft_bench.h"
-#endif
-
-static double now_ns(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec * 1e9 + (double)ts.tv_nsec;
-}
 
 static void *alloc64(size_t bytes)
 {
@@ -228,12 +214,6 @@ static void vdsp_teardown(void *state)
 }
 #endif
 
-#ifdef BENCH_POCKETFFT
-static void *pocket_setup(unsigned log2n, float *in, float *out) { return pocketfft_bench_setup(log2n, in, out); }
-static void pocket_run(void *state) { pocketfft_bench_run(state); }
-static void pocket_teardown(void *state) { pocketfft_bench_teardown(state); }
-#endif
-
 static const bench_lib libs[] = {
     {"twofft", twofft_setup, twofft_run, twofft_teardown},
 #ifdef BENCH_FFTW
@@ -247,9 +227,6 @@ static const bench_lib libs[] = {
 #endif
 #ifdef BENCH_VDSP
     {"vdsp", vdsp_setup, vdsp_run, vdsp_teardown},
-#endif
-#ifdef BENCH_POCKETFFT
-    {"pocketfft", pocket_setup, pocket_run, pocket_teardown},
 #endif
 #ifdef BENCH_KISSFFT
     {"kissfft", kiss_setup, kiss_run, kiss_teardown},
@@ -306,18 +283,7 @@ int main(int argc, char **argv)
                          : !strcmp(argv[a + 1], "estimate") ? FFTW_ESTIMATE : FFTW_MEASURE;
 #endif
     }
-#if defined(__linux__)
-    if (cpu >= 0) {
-        cpu_set_t set;
-        CPU_ZERO(&set);
-        CPU_SET(cpu, &set);
-        if (sched_setaffinity(0, sizeof set, &set) != 0)
-            fprintf(stderr, "warning: could not pin to cpu %d\n", cpu);
-    }
-#elif defined(__APPLE__)
-    (void)cpu;
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-#endif
+    bench_prepare_cpu(cpu);
 
     printf("%-10s %5s %14s %12s\n", "lib", "log2n", "ns/transform", "ns/(N log2N)");
     for (log2n = min_log2; log2n <= max_log2; log2n++) {

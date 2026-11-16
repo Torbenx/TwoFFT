@@ -8,6 +8,13 @@
 #define TWOFFT_TARGET /* NEON is part of the arm64 baseline */
 #define TWOFFT_VW 4 /* float lanes per vector */
 #define TWOFFT_VW_LOG2 2
+/* Twiddle format / butterfly flavour, see twofft_make_twiddles(). NEON's fused multiply-add
+ * overwrites its addend; the ratio butterflies then need register copies that outweigh the
+ * saved multiplications (measured: equal on Apple M2, 3% to 20% slower on Cortex cores). */
+#ifndef TWOFFT_NEON_RATIO_TWIDDLES
+#define TWOFFT_NEON_RATIO_TWIDDLES 0
+#endif
+#define TWOFFT_RATIO_TWIDDLES TWOFFT_NEON_RATIO_TWIDDLES
 
 #define vf float32x4_t
 
@@ -24,12 +31,35 @@
 
 /* Load / store TWOFFT_VW interleaved complex numbers as separate real / imaginary vectors.
  * Lane c of the loaded vectors holds element TWOFFT_LANE_ELEM(c). */
+/* Apple cores run explicit (un)zips slightly faster than the structure load / store
+ * instructions (2% to 9% for the affected passes on M2), Cortex cores the opposite. */
+#if defined(__APPLE__) && !defined(TWOFFT_NEON_STRUCTURE_LOADS)
+#define TWOFFT_NEON_EXPLICIT_LOAD2
+#define TWOFFT_NEON_EXPLICIT_STORE2
+#endif
+#ifdef TWOFFT_NEON_EXPLICIT_LOAD2
+#define V_LOAD2(p, re, im)                                               \
+    do {                                                                 \
+        float32x4_t ld0_ = vld1q_f32(p), ld1_ = vld1q_f32((p) + 4);      \
+        (re) = vuzp1q_f32(ld0_, ld1_);                                   \
+        (im) = vuzp2q_f32(ld0_, ld1_);                                   \
+    } while (0)
+#else
 #define V_LOAD2(p, re, im)                 \
     do {                                   \
         float32x4x2_t ld2_ = vld2q_f32(p); \
         (re) = ld2_.val[0];                \
         (im) = ld2_.val[1];                \
     } while (0)
+#endif
+#ifdef TWOFFT_NEON_EXPLICIT_STORE2
+#define V_STORE2(p, re, im)                              \
+    do {                                                 \
+        float32x4_t st0_ = (re), st1_ = (im);            \
+        vst1q_f32((p), vzip1q_f32(st0_, st1_));          \
+        vst1q_f32((p) + 4, vzip2q_f32(st0_, st1_));      \
+    } while (0)
+#else
 #define V_STORE2(p, re, im)     \
     do {                        \
         float32x4x2_t st2_;     \
@@ -37,6 +67,7 @@
         st2_.val[1] = (im);     \
         vst2q_f32((p), st2_);   \
     } while (0)
+#endif
 #define TWOFFT_LANE_ELEM(c) (c)
 
 /* In-place transpose of the TWOFFT_VW x TWOFFT_VW matrix held in v[0 .. TWOFFT_VW-1]. */

@@ -30,6 +30,16 @@
 
 /* Blocks of up to 2^TWOFFT_BLOCK_LOG2 points are transformed pass by pass, larger ones
  * depth first. */
+#ifdef TWOFFT_TUNING
+/* Development only (bench/tune.c): run time adjustable parameters and the possibility to
+ * run only some stages of a transform (1: leaf pass, 2: middle passes, 4: final pass). */
+unsigned twofft_tuning_block_log2 = 12;
+unsigned twofft_tuning_stages = 7;
+#define TWOFFT_BLOCK_LOG2 twofft_tuning_block_log2
+#define TWOFFT_STAGE_ENABLED(bit) (twofft_tuning_stages & (bit))
+#else
+#define TWOFFT_STAGE_ENABLED(bit) 1
+#endif
 #ifndef TWOFFT_BLOCK_LOG2
 #define TWOFFT_BLOCK_LOG2 12
 #endif
@@ -41,11 +51,13 @@
  * 2^(size_log[j] - radix_log[j]) points into transforms of 2^size_log[j] points. */
 typedef struct twofft_plan {
     uint8_t log2n;
-    uint8_t leaf_log; /* 3 or 4 */
-    uint8_t npasses;  /* >= 1; the last pass is the final pass */
+    uint8_t leaf_l1_log;    /* leaf stage 1: DFT size (2 or 3) */
+    uint8_t leaf_radix_log; /* leaf stage 2: radix (0: none, 2 or 3) */
+    uint8_t npasses;        /* >= 1; the last pass is the final pass */
     uint8_t radix_log[TWOFFT_MAX_PASSES];
     uint8_t size_log[TWOFFT_MAX_PASSES];
     const float *tw[TWOFFT_MAX_PASSES];
+    const float *leaf_tw;
 } twofft_plan;
 
 /* Reverses the lowest `bits` bits of v. */
@@ -90,14 +102,16 @@ static const float twofft_w16[3][2][4] = {
 #include "twofft_simd_neon.h"
 #include "twofft_kernels.h"
 #include "twofft_simd_undef.h"
-#define TWOFFT_VW_NATIVE 4
+#define TWOFFT_VW_NATIVE twofft_neon_vw
+#define TWOFFT_RATIO_NATIVE twofft_neon_ratio_twiddles
 #endif
 
 #if TWOFFT_ARCH_X86_64
 #include "twofft_simd_sse2.h"
 #include "twofft_kernels.h"
 #include "twofft_simd_undef.h"
-#define TWOFFT_VW_NATIVE 4
+#define TWOFFT_VW_NATIVE twofft_sse2_vw
+#define TWOFFT_RATIO_NATIVE twofft_sse2_ratio_twiddles
 #endif
 
 /* ---------------------------------------------------------------------------------------
@@ -125,24 +139,46 @@ static void twofft_free(void *p)
 #endif
 }
 
-/* Twiddle table of a radix 2^radix_log pass with sub-transform size 2^sub_log for vectors
- * of vw lanes: for every vector position the powers w^1 .. w^(radix-1), each stored as vw
- * real parts followed by vw imaginary parts. */
-static float *twofft_make_twiddles(unsigned radix_log, unsigned sub_log, unsigned vw)
+/* Twiddle table of a radix 2^radix_log pass with sub-transform size S = 2^sub_log for
+ * vectors of vw lanes. With w = exp(-2 pi i k / (radix S)) for position k, the table holds
+ * for every vector position
+ *
+ *   plain format:  w^1 .. w^(radix-1), each as vw real parts followed by vw imaginary parts,
+ *   ratio format:  radix 4: w^2, w;  radix 8: w^4, w^2, w, w * exp(-2 pi i / 8),
+ *                  each as vw values of c = re followed by vw values of r = im / re.
+ *
+ * The ratio format serves the butterflies built from fused multiply-adds, which compute
+ * w * z as c * ((z.re - r z.im) + i (z.im + r z.re)). */
+static float *twofft_make_twiddles(unsigned radix_log, unsigned sub_log, unsigned vw, int ratio)
 {
+    static const double pi = 3.14159265358979323846264338327950288;
     const size_t radix = (size_t)1 << radix_log, S = (size_t)1 << sub_log;
-    const double step = -6.283185307179586476925286766559 / (double)(radix * S);
-    float *tab = (float *)twofft_alloc(2 * (radix - 1) * S * sizeof(float));
+    const size_t count = ratio ? radix_log + 1 - (radix_log == 2) : radix - 1; /* twiddles per position */
+    const double step = -2.0 * pi / (double)(radix * S);
+    float *tab = (float *)twofft_alloc(2 * count * S * sizeof(float));
     float *t = tab;
     size_t p, j, l;
     if (!tab)
         return NULL;
     for (p = 0; p < S; p += vw) {
-        for (j = 1; j < radix; j++) {
+        for (j = 0; j < count; j++) {
             for (l = 0; l < vw; l++) {
-                const double a = step * (double)(j * (p + l));
-                t[l] = (float)cos(a);
-                t[vw + l] = (float)sin(a);
+                const double k = (double)(p + l);
+                if (!ratio) {
+                    const double a = step * (double)(j + 1) * k;
+                    t[l] = (float)cos(a);
+                    t[vw + l] = (float)sin(a);
+                } else {
+                    /* powers radix/2, radix/4, .., 1 and for radix 8 finally w * exp(-2 pi i / 8) */
+                    const double a = j < radix_log ? step * (double)(radix >> (j + 1)) * k : step * k - pi / 4;
+                    double c = cos(a);
+                    /* cos is zero for w^(radix/2) in the middle of the table; a tiny value
+                     * instead changes the result by less than the rounding errors */
+                    if (fabs(c) < 1e-9)
+                        c = 7.450580596923828125e-9; /* 2^-27 */
+                    t[l] = (float)c;
+                    t[vw + l] = (float)(sin(a) / c);
+                }
             }
             t += 2 * vw;
         }
@@ -152,6 +188,7 @@ static float *twofft_make_twiddles(unsigned radix_log, unsigned sub_log, unsigne
 
 struct twofft_context {
     unsigned vw;
+    int ratio; /* twiddle table format */
     float *twiddles[2][TWOFFT_MAX_LOG2_SIZE + 1]; /* [radix_log - 2][sub_log] */
     twofft_plan *plans[TWOFFT_MAX_LOG2_SIZE + 1];
 };
@@ -162,7 +199,7 @@ static const float *twofft_get_twiddles(twofft_context *ctx, unsigned radix_log,
     float *tab = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
     if (!tab) {
         float *expected = NULL;
-        tab = twofft_make_twiddles(radix_log, sub_log, ctx->vw);
+        tab = twofft_make_twiddles(radix_log, sub_log, ctx->vw, ctx->ratio);
         if (tab && !__atomic_compare_exchange_n(slot, &expected, tab, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
             twofft_free(tab);
             tab = expected;
@@ -171,25 +208,70 @@ static const float *twofft_get_twiddles(twofft_context *ctx, unsigned radix_log,
     return tab;
 }
 
-/* Chooses the decomposition of a size 2^n transform. */
-static void twofft_decompose(twofft_plan *pl, unsigned n)
+/* A decomposition of a size 2^n transform: "<leaf>,<pass radix logs>" where leaf is
+ * 0: 8, 1: 4x4, 2: 4x8, 3: 8x4, 4: 8x8 and every pass is 2 (radix 4) or 3 (radix 8). */
+static const uint8_t twofft_leaf_shapes[5][2] = {{3, 0}, {2, 2}, {2, 3}, {3, 2}, {3, 3}};
+
+static int twofft_parse_decomposition(twofft_plan *pl, unsigned n, const char *spec)
 {
-    unsigned rest, k = 0, size;
+    unsigned size, k = 0;
+    if (spec[0] < '0' || spec[0] > '4')
+        return -1;
     pl->log2n = (uint8_t)n;
-    /* 16 point leaves unless that leaves a single level */
-    pl->leaf_log = (uint8_t)(n == 5 ? 3 : 4);
-    rest = n - pl->leaf_log;
-    size = pl->leaf_log;
-    /* radix 8 passes where possible, radix 4 passes first */
-    while (rest > 0) {
-        const unsigned rl = (rest % 3 == 0) ? 3 : 2;
-        size += rl;
-        pl->radix_log[k] = (uint8_t)rl;
+    pl->leaf_l1_log = twofft_leaf_shapes[spec[0] - '0'][0];
+    pl->leaf_radix_log = twofft_leaf_shapes[spec[0] - '0'][1];
+    size = pl->leaf_l1_log + pl->leaf_radix_log;
+    for (spec++; *spec; spec++) {
+        if ((*spec != '2' && *spec != '3') || k == TWOFFT_MAX_PASSES)
+            return -1;
+        size += (unsigned)(*spec - '0');
+        pl->radix_log[k] = (uint8_t)(*spec - '0');
         pl->size_log[k] = (uint8_t)size;
-        rest -= rl;
         k++;
     }
     pl->npasses = (uint8_t)k;
+    return (size == n && k >= 1) ? 0 : -1;
+}
+
+/* Chooses the decomposition of a size 2^n transform. */
+static void twofft_decompose(twofft_plan *pl, unsigned n)
+{
+    char spec[TWOFFT_MAX_PASSES + 2];
+    unsigned rest, k = 1;
+    /* leaf: 3, 4 or 5 levels such that the rest is a multiple of 3 where possible */
+    static const char leaf_for_rest[3] = {'0', '1', '2'};
+    if (n == 5) {
+        spec[0] = '0', rest = 2;
+    } else if (n == 6) {
+        spec[0] = '1', rest = 2;
+    } else {
+        spec[0] = leaf_for_rest[n % 3];
+        rest = n - (3 + n % 3);
+    }
+    while (rest > 0) {
+        const unsigned rl = (rest % 3 == 0) ? 3 : 2;
+        spec[k++] = (char)('0' + rl);
+        rest -= rl;
+    }
+    spec[k] = 0;
+    twofft_parse_decomposition(pl, n, spec);
+}
+
+static int twofft_plan_tables(twofft_context *ctx, twofft_plan *pl)
+{
+    unsigned k;
+    pl->leaf_tw = NULL;
+    if (pl->leaf_radix_log) {
+        pl->leaf_tw = twofft_get_twiddles(ctx, pl->leaf_radix_log, pl->leaf_l1_log);
+        if (!pl->leaf_tw)
+            return -1;
+    }
+    for (k = 0; k < pl->npasses; k++) {
+        pl->tw[k] = twofft_get_twiddles(ctx, pl->radix_log[k], pl->size_log[k] - pl->radix_log[k]);
+        if (!pl->tw[k])
+            return -1;
+    }
+    return 0;
 }
 
 static const twofft_plan *twofft_get_plan(twofft_context *ctx, unsigned n)
@@ -198,17 +280,13 @@ static const twofft_plan *twofft_get_plan(twofft_context *ctx, unsigned n)
     twofft_plan *pl = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
     if (!pl) {
         twofft_plan *expected = NULL;
-        unsigned k;
         pl = (twofft_plan *)malloc(sizeof(twofft_plan));
         if (!pl)
             return NULL;
         twofft_decompose(pl, n);
-        for (k = 0; k < pl->npasses; k++) {
-            pl->tw[k] = twofft_get_twiddles(ctx, pl->radix_log[k], pl->size_log[k] - pl->radix_log[k]);
-            if (!pl->tw[k]) {
-                free(pl);
-                return NULL;
-            }
+        if (twofft_plan_tables(ctx, pl) != 0) {
+            free(pl);
+            return NULL;
         }
         if (!__atomic_compare_exchange_n(slot, &expected, pl, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
             free(pl);
@@ -218,11 +296,31 @@ static const twofft_plan *twofft_get_plan(twofft_context *ctx, unsigned n)
     return pl;
 }
 
+#ifdef TWOFFT_TUNING
+/* Development only: forces the decomposition used for size 2^n (not thread safe). */
+int twofft_tuning_set_decomposition(twofft_context *ctx, unsigned n, const char *spec);
+int twofft_tuning_set_decomposition(twofft_context *ctx, unsigned n, const char *spec)
+{
+    twofft_plan *pl = (twofft_plan *)malloc(sizeof(twofft_plan));
+    if (!pl || n < TWOFFT_MIN_PLAN_LOG2 || n > TWOFFT_MAX_LOG2_SIZE || twofft_parse_decomposition(pl, n, spec) != 0 ||
+        ((size_t)1 << n) < ((size_t)TWOFFT_VW_NATIVE << (pl->leaf_l1_log + pl->leaf_radix_log)) ||
+        twofft_plan_tables(ctx, pl) != 0) {
+        free(pl);
+        return -1;
+    }
+    free(ctx->plans[n]);
+    ctx->plans[n] = pl;
+    return 0;
+}
+#endif
+
 twofft_context *twofft_context_create(void)
 {
     twofft_context *ctx = (twofft_context *)calloc(1, sizeof(twofft_context));
-    if (ctx)
+    if (ctx) {
         ctx->vw = TWOFFT_VW_NATIVE;
+        ctx->ratio = TWOFFT_RATIO_NATIVE;
+    }
     return ctx;
 }
 

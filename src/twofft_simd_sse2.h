@@ -5,6 +5,11 @@
 #define TWOFFT_TARGET /* SSE2 is part of the x86-64 baseline */
 #define TWOFFT_VW 4
 #define TWOFFT_VW_LOG2 2
+/* Without fused multiply-add the plain twiddle format needs fewer operations. */
+#ifndef TWOFFT_SSE2_RATIO_TWIDDLES
+#define TWOFFT_SSE2_RATIO_TWIDDLES 0
+#endif
+#define TWOFFT_RATIO_TWIDDLES TWOFFT_SSE2_RATIO_TWIDDLES
 
 #define vf __m128
 
